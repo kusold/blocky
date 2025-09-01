@@ -42,16 +42,15 @@ customDNS:
   # optional: if true (default), return empty result for unmapped query types (for example TXT, MX or AAAA if only IPv4 address is defined).
   # if false, queries with unmapped types will be forwarded to the upstream resolver
   filterUnmappedTypes: true
-  # optional: replace domain in the query with other domain before resolver lookup in the mapping
-  rewrite:
-    example.com: printer.lan
-  mapping:
-    printer.lan: 192.168.178.3,2001:0db8:85a3:08d3:1319:8a2e:0370:7344
   # optional: client-specific DNS configurations
   clientGroups:
     # default group for unmatched clients
     default:
+      # optional: replace domain in the query with other domain before resolver lookup in the mapping
+      rewrite:
+        example.com: printer.lan
       mapping:
+        printer.lan: 192.168.178.3,2001:0db8:85a3:08d3:1319:8a2e:0370:7344
         router.lan: 192.168.1.1
     # exact IP address match
     192.168.1.10:

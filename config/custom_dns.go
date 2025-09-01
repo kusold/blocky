@@ -37,31 +37,33 @@ type CustomDNSGroup struct {
 func (c *CustomDNS) migrate(logger *logrus.Entry) bool {
 	migrated := false
 
-	// Only migrate if client groups are explicitly defined in config
-	// If no client groups are defined, leave legacy fields alone for backward compatibility
-	if len(c.ClientGroups) > 0 {
-		// If clientGroups exist but we also have old-style mapping/rewrite/zone, migrate to default group
-		if len(c.Mapping) > 0 || len(c.Rewrite) > 0 || len(c.Zone.RRs) > 0 {
-			logger.Warn("migrating CustomDNS configuration from old format to client groups format")
-			logger.Warn("consider updating your configuration to use 'clientGroups.default' instead of top-level 'mapping'")
+	// If we have legacy fields, migrate them to the default group
+	if len(c.Mapping) > 0 || len(c.Rewrite) > 0 || len(c.Zone.RRs) > 0 {
+		logger.Warn("migrating CustomDNS configuration from old format to client groups format")
+		logger.Warn("consider updating your configuration to use 'clientGroups.default' instead of top-level 'mapping'")
 
-			// Create default group with existing configuration
-			defaultGroup := CustomDNSGroup{
-				RewriterConfig: c.RewriterConfig,
-				Mapping:        c.Mapping,
-				Zone:           c.Zone,
-			}
-
-			c.ClientGroups["default"] = defaultGroup
-			migrated = true
-
-			// Clear old fields after migration to avoid confusion
-			c.Mapping = make(CustomDNSMapping)
-			c.RewriterConfig = RewriterConfig{}
-			c.Zone = ZoneFileDNS{}
+		if c.ClientGroups == nil {
+			c.ClientGroups = make(map[string]CustomDNSGroup)
 		}
 
-		// Ensure we always have a default group if client groups are used
+		// Create default group with existing configuration
+		defaultGroup := CustomDNSGroup{
+			RewriterConfig: c.RewriterConfig,
+			Mapping:        c.Mapping,
+			Zone:           c.Zone,
+		}
+
+		c.ClientGroups["default"] = defaultGroup
+		migrated = true
+
+		// Clear old fields after migration to avoid confusion
+		c.Mapping = make(CustomDNSMapping)
+		c.RewriterConfig = RewriterConfig{}
+		c.Zone = ZoneFileDNS{}
+	}
+
+	// Ensure we always have a default group if client groups are used
+	if len(c.ClientGroups) > 0 {
 		if _, hasDefault := c.ClientGroups["default"]; !hasDefault {
 			// Create an empty default group
 			c.ClientGroups["default"] = CustomDNSGroup{}
@@ -207,7 +209,7 @@ func (c *CustomDNS) LogConfig(logger *logrus.Entry) {
 	logger.Debugf("filterUnmappedTypes = %t", c.FilterUnmappedTypes)
 
 	if len(c.ClientGroups) > 0 {
-		logger.Info("client groups:")
+		logger.Info("client groups configured:")
 		for groupName, group := range c.ClientGroups {
 			logger.Infof("  %s:", groupName)
 			if len(group.Mapping) > 0 {
