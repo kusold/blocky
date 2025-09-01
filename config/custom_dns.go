@@ -37,31 +37,31 @@ type CustomDNSGroup struct {
 func (c *CustomDNS) migrate(logger *logrus.Entry) bool {
 	migrated := false
 
-	// If clientGroups is empty but we have old-style mapping/rewrite/zone, migrate to default group
-	if len(c.ClientGroups) == 0 && (len(c.Mapping) > 0 || len(c.Rewrite) > 0 || len(c.Zone.RRs) > 0) {
-		logger.Warn("migrating CustomDNS configuration from old format to client groups format")
-		logger.Warn("consider updating your configuration to use 'clientGroups.default' instead of top-level 'mapping'")
-
-		if c.ClientGroups == nil {
-			c.ClientGroups = make(map[string]CustomDNSGroup)
-		}
-
-		// Create default group with existing configuration
-		defaultGroup := CustomDNSGroup{
-			RewriterConfig: c.RewriterConfig,
-			Mapping:        c.Mapping,
-			Zone:           c.Zone,
-		}
-
-		c.ClientGroups["default"] = defaultGroup
-		migrated = true
-
-		// Clear old fields to avoid confusion (but keep them for backward compatibility in YAML)
-		// Don't clear them completely as they might be needed for unmarshaling
-	}
-
-	// Ensure we always have a default group if client groups are used
+	// Only migrate if client groups are explicitly defined in config
+	// If no client groups are defined, leave legacy fields alone for backward compatibility
 	if len(c.ClientGroups) > 0 {
+		// If clientGroups exist but we also have old-style mapping/rewrite/zone, migrate to default group
+		if len(c.Mapping) > 0 || len(c.Rewrite) > 0 || len(c.Zone.RRs) > 0 {
+			logger.Warn("migrating CustomDNS configuration from old format to client groups format")
+			logger.Warn("consider updating your configuration to use 'clientGroups.default' instead of top-level 'mapping'")
+
+			// Create default group with existing configuration
+			defaultGroup := CustomDNSGroup{
+				RewriterConfig: c.RewriterConfig,
+				Mapping:        c.Mapping,
+				Zone:           c.Zone,
+			}
+
+			c.ClientGroups["default"] = defaultGroup
+			migrated = true
+
+			// Clear old fields after migration to avoid confusion
+			c.Mapping = make(CustomDNSMapping)
+			c.RewriterConfig = RewriterConfig{}
+			c.Zone = ZoneFileDNS{}
+		}
+
+		// Ensure we always have a default group if client groups are used
 		if _, hasDefault := c.ClientGroups["default"]; !hasDefault {
 			// Create an empty default group
 			c.ClientGroups["default"] = CustomDNSGroup{}
@@ -93,8 +93,24 @@ func (c *CustomDNS) validateClientGroupName(name string) error {
 		return nil
 	}
 
-	// Check if it's a valid CIDR
-	if _, _, err := net.ParseCIDR(name); err == nil {
+	// Check if it looks like a CIDR (contains slash)
+	if strings.Contains(name, "/") {
+		if _, ipNet, err := net.ParseCIDR(name); err != nil {
+			return fmt.Errorf("invalid CIDR notation: %w", err)
+		} else {
+			// Additional validation: check if prefix length is valid for IP version
+			ones, bits := ipNet.Mask.Size()
+			if ones < 0 || ones > bits {
+				return fmt.Errorf("invalid CIDR prefix length in '%s'", name)
+			}
+			// Check IPv4 and IPv6 prefix length limits
+			if ipNet.IP.To4() != nil && ones > 32 {
+				return fmt.Errorf("IPv4 CIDR prefix length cannot exceed 32 in '%s'", name)
+			}
+			if ipNet.IP.To4() == nil && ones > 128 {
+				return fmt.Errorf("IPv6 CIDR prefix length cannot exceed 128 in '%s'", name)
+			}
+		}
 		return nil
 	}
 
