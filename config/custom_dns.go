@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -13,10 +14,100 @@ import (
 type CustomDNS struct {
 	RewriterConfig `yaml:",inline"`
 
-	CustomTTL           Duration         `default:"1h"   yaml:"customTTL"`
-	Mapping             CustomDNSMapping `yaml:"mapping"`
-	Zone                ZoneFileDNS      `default:""     yaml:"zone"`
-	FilterUnmappedTypes bool             `default:"true" yaml:"filterUnmappedTypes"`
+	// Global settings
+	CustomTTL           Duration `default:"1h"   yaml:"customTTL"`
+	FilterUnmappedTypes bool     `default:"true" yaml:"filterUnmappedTypes"`
+
+	// New client groups
+	ClientGroups map[string]CustomDNSGroup `yaml:"clientGroups"`
+
+	// Backward compatibility (deprecated)
+	Mapping CustomDNSMapping `yaml:"mapping"`
+	Zone    ZoneFileDNS      `default:""     yaml:"zone"`
+}
+
+// CustomDNSGroup represents DNS configuration for a specific client group
+type CustomDNSGroup struct {
+	RewriterConfig `yaml:",inline"`
+	Mapping        CustomDNSMapping `yaml:"mapping"`
+	Zone           ZoneFileDNS      `default:"" yaml:"zone"`
+}
+
+// migrate migrates old configuration format to new client groups format
+func (c *CustomDNS) migrate(logger *logrus.Entry) bool {
+	migrated := false
+
+	// If clientGroups is empty but we have old-style mapping/rewrite/zone, migrate to default group
+	if len(c.ClientGroups) == 0 && (len(c.Mapping) > 0 || len(c.Rewrite) > 0 || len(c.Zone.RRs) > 0) {
+		logger.Warn("migrating CustomDNS configuration from old format to client groups format")
+		logger.Warn("consider updating your configuration to use 'clientGroups.default' instead of top-level 'mapping'")
+
+		if c.ClientGroups == nil {
+			c.ClientGroups = make(map[string]CustomDNSGroup)
+		}
+
+		// Create default group with existing configuration
+		defaultGroup := CustomDNSGroup{
+			RewriterConfig: c.RewriterConfig,
+			Mapping:        c.Mapping,
+			Zone:           c.Zone,
+		}
+
+		c.ClientGroups["default"] = defaultGroup
+		migrated = true
+
+		// Clear old fields to avoid confusion (but keep them for backward compatibility in YAML)
+		// Don't clear them completely as they might be needed for unmarshaling
+	}
+
+	// Ensure we always have a default group if client groups are used
+	if len(c.ClientGroups) > 0 {
+		if _, hasDefault := c.ClientGroups["default"]; !hasDefault {
+			// Create an empty default group
+			c.ClientGroups["default"] = CustomDNSGroup{}
+		}
+	}
+
+	return migrated
+}
+
+// validateClientGroups validates client group configuration
+func (c *CustomDNS) validateClientGroups() error {
+	for groupName := range c.ClientGroups {
+		if err := c.validateClientGroupName(groupName); err != nil {
+			return fmt.Errorf("invalid client group name '%s': %w", groupName, err)
+		}
+	}
+	return nil
+}
+
+// validateClientGroupName validates a client group name (IP, CIDR, or wildcard pattern)
+func (c *CustomDNS) validateClientGroupName(name string) error {
+	// Skip validation for "default" group
+	if name == "default" {
+		return nil
+	}
+
+	// Check if it's a valid IP address
+	if net.ParseIP(name) != nil {
+		return nil
+	}
+
+	// Check if it's a valid CIDR
+	if _, _, err := net.ParseCIDR(name); err == nil {
+		return nil
+	}
+
+	// Check if it's a valid wildcard pattern
+	if strings.Contains(name, "*") || strings.Contains(name, "?") || strings.Contains(name, "[") {
+		if _, err := filepath.Match(name, "test"); err != nil {
+			return fmt.Errorf("invalid wildcard pattern: %w", err)
+		}
+		return nil
+	}
+
+	// If it's not IP, CIDR, or wildcard, treat it as a literal client name (which is valid)
+	return nil
 }
 
 type (
@@ -91,7 +182,7 @@ func (c *CustomDNSEntries) UnmarshalYAML(unmarshal func(interface{}) error) erro
 
 // IsEnabled implements `config.Configurable`.
 func (c *CustomDNS) IsEnabled() bool {
-	return len(c.Mapping) != 0
+	return len(c.Mapping) != 0 || len(c.ClientGroups) != 0
 }
 
 // LogConfig implements `config.Configurable`.
@@ -99,10 +190,30 @@ func (c *CustomDNS) LogConfig(logger *logrus.Entry) {
 	logger.Debugf("TTL = %s", c.CustomTTL)
 	logger.Debugf("filterUnmappedTypes = %t", c.FilterUnmappedTypes)
 
-	logger.Info("mapping:")
+	if len(c.ClientGroups) > 0 {
+		logger.Info("client groups:")
+		for groupName, group := range c.ClientGroups {
+			logger.Infof("  %s:", groupName)
+			if len(group.Mapping) > 0 {
+				logger.Info("    mapping:")
+				for key, val := range group.Mapping {
+					logger.Infof("      %s = %s", key, val)
+				}
+			}
+			if len(group.Rewrite) > 0 {
+				logger.Info("    rewrite:")
+				for key, val := range group.Rewrite {
+					logger.Infof("      %s = %s", key, val)
+				}
+			}
+		}
+	}
 
-	for key, val := range c.Mapping {
-		logger.Infof("  %s = %s", key, val)
+	if len(c.Mapping) > 0 {
+		logger.Info("mapping (deprecated - use clientGroups):")
+		for key, val := range c.Mapping {
+			logger.Infof("  %s = %s", key, val)
+		}
 	}
 }
 

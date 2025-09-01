@@ -332,4 +332,343 @@ var _ = Describe("Custom DNS tests", func() {
 			})
 		})
 	})
+
+	Describe("Client Groups configuration", func() {
+		BeforeEach(func(ctx context.Context) {
+			// Create a mokka container for upstream DNS
+			_, err = createDNSMokkaContainer(ctx, "moka1", e2eNet, `A google/NOERROR("A 1.2.3.4 123")`)
+			Expect(err).Should(Succeed())
+		})
+
+		When("Client groups with different mappings are configured", func() {
+			BeforeEach(func(ctx context.Context) {
+				blocky, err = createBlockyContainer(ctx, e2eNet,
+					"upstreams:",
+					"  groups:",
+					"    default:",
+					"      - moka1",
+					"customDNS:",
+					"  customTTL: 30m",
+					"  clientGroups:",
+					"    default:",
+					"      mapping:",
+					"        default.lan: 192.168.1.1",
+					"    laptop*:",
+					"      mapping:",
+					"        laptop.lan: 192.168.1.100",
+					"      rewrite:",
+					"        dev: local",
+					"    192.168.1.0/24:",
+					"      mapping:",
+					"        internal.lan: 10.0.0.1",
+					"    192.168.1.10:",
+					"      mapping:",
+					"        specific.lan: 192.168.1.99",
+				)
+				Expect(err).Should(Succeed())
+			})
+
+			It("Should resolve different mappings for different client groups", func(ctx context.Context) {
+				By("Resolving specific IP group mapping", func() {
+					// Request from 192.168.1.10 should match exact IP group
+					msg := util.NewMsgWithQuestion("specific.lan.", A)
+					msg.SetEdns0(4096, false) // Enable EDNS to allow client subnet
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{192, 168, 1, 10},
+					})
+
+					Expect(doDNSRequest(ctx, blocky, msg)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("specific.lan.", A, "192.168.1.99"),
+								HaveTTL(BeNumerically("==", 1800)), // 30m = 1800s
+							))
+				})
+
+				By("Resolving CIDR subnet group mapping", func() {
+					// Request from 192.168.1.50 should match CIDR group
+					msg := util.NewMsgWithQuestion("internal.lan.", A)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{192, 168, 1, 50},
+					})
+
+					Expect(doDNSRequest(ctx, blocky, msg)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("internal.lan.", A, "10.0.0.1"),
+								HaveTTL(BeNumerically("==", 1800)),
+							))
+				})
+
+				By("Resolving default group mapping for unmatched client", func() {
+					// Request from 10.0.0.50 should match default group
+					msg := util.NewMsgWithQuestion("default.lan.", A)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{10, 0, 0, 50},
+					})
+
+					Expect(doDNSRequest(ctx, blocky, msg)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("default.lan.", A, "192.168.1.1"),
+								HaveTTL(BeNumerically("==", 1800)),
+							))
+				})
+			})
+		})
+
+		When("Client groups with rewrite rules are configured", func() {
+			BeforeEach(func(ctx context.Context) {
+				blocky, err = createBlockyContainer(ctx, e2eNet,
+					"upstreams:",
+					"  groups:",
+					"    default:",
+					"      - moka1",
+					"customDNS:",
+					"  customTTL: 1h",
+					"  clientGroups:",
+					"    default:",
+					"      mapping:",
+					"        test.lan: 192.168.1.1",
+					"    laptop*:",
+					"      mapping:",
+					"        test.local: 192.168.1.100",
+					"      rewrite:",
+					"        dev: local",
+				)
+				Expect(err).Should(Succeed())
+			})
+
+			It("Should apply group-specific rewrite rules", func(ctx context.Context) {
+				By("Applying rewrite rule for laptop client", func() {
+					// Mock client ID to simulate wildcard matching
+					// Note: In real e2e testing, we'd need to configure client name resolution
+					// For now, we'll test the domain rewriting functionality
+					msg := util.NewMsgWithQuestion("test.dev.", A)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{192, 168, 1, 100}, // Should match CIDR first, not laptop*
+					})
+
+					// This should resolve test.local instead due to rewrite rule
+					Expect(doDNSRequest(ctx, blocky, msg)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("test.dev.", A, "192.168.1.100"),
+								HaveTTL(BeNumerically("==", 3600)),
+							))
+				})
+			})
+		})
+
+		When("Client groups with zone files are configured", func() {
+			BeforeEach(func(ctx context.Context) {
+				blocky, err = createBlockyContainer(ctx, e2eNet,
+					"upstreams:",
+					"  groups:",
+					"    default:",
+					"      - moka1",
+					"customDNS:",
+					"  customTTL: 1h",
+					"  clientGroups:",
+					"    default:",
+					"      mapping:",
+					"        default.lan: 192.168.1.1",
+					"    192.168.1.0/24:",
+					"      zone: |",
+					"        $ORIGIN internal.local.",
+					"        www 3600 A 10.0.0.100",
+					"        db 3600 A 10.0.0.101",
+				)
+				Expect(err).Should(Succeed())
+			})
+
+			It("Should resolve zone file records for matching client group", func(ctx context.Context) {
+				By("Resolving zone file record for CIDR client", func() {
+					msg := util.NewMsgWithQuestion("www.internal.local.", A)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{192, 168, 1, 50},
+					})
+
+					Expect(doDNSRequest(ctx, blocky, msg)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("www.internal.local.", A, "10.0.0.100"),
+								HaveTTL(BeNumerically("==", 3600)),
+							))
+				})
+
+				By("Not resolving zone file record for non-matching client", func() {
+					msg := util.NewMsgWithQuestion("www.internal.local.", A)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{10, 0, 0, 50}, // Should use default group
+					})
+
+					// Should delegate to upstream since default group doesn't have this record
+					resp, err := doDNSRequest(ctx, blocky, msg)
+					Expect(err).Should(Succeed())
+					Expect(resp.Answer).Should(BeEmpty()) // No match in default group
+				})
+			})
+		})
+
+		When("Legacy mapping with client groups configured", func() {
+			BeforeEach(func(ctx context.Context) {
+				blocky, err = createBlockyContainer(ctx, e2eNet,
+					"upstreams:",
+					"  groups:",
+					"    default:",
+					"      - moka1",
+					"customDNS:",
+					"  customTTL: 1h",
+					"  # Legacy mapping (should be migrated to default group)",
+					"  mapping:",
+					"    legacy.lan: 192.168.1.200",
+					"  # Client groups",
+					"  clientGroups:",
+					"    laptop*:",
+					"      mapping:",
+					"        laptop.lan: 192.168.1.100",
+				)
+				Expect(err).Should(Succeed())
+			})
+
+			It("Should migrate legacy mapping to default group", func(ctx context.Context) {
+				By("Resolving legacy mapping from any client", func() {
+					msg := util.NewMsgWithQuestion("legacy.lan.", A)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{10, 0, 0, 50}, // Non-matching client -> default group
+					})
+
+					Expect(doDNSRequest(ctx, blocky, msg)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("legacy.lan.", A, "192.168.1.200"),
+								HaveTTL(BeNumerically("==", 3600)),
+							))
+				})
+
+				By("Resolving client-specific mapping", func() {
+					// We can't easily test wildcard client matching in e2e without
+					// configuring client name resolution, but CIDR-based testing
+					// still validates the client group functionality
+					msg := util.NewMsgWithQuestion("laptop.lan.", A)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{10, 0, 0, 50}, // Non-matching -> default
+					})
+
+					// Should not resolve laptop.lan from default group
+					resp, err := doDNSRequest(ctx, blocky, msg)
+					Expect(err).Should(Succeed())
+					Expect(resp.Answer).Should(BeEmpty())
+				})
+			})
+		})
+
+		When("Client groups with reverse DNS are configured", func() {
+			BeforeEach(func(ctx context.Context) {
+				blocky, err = createBlockyContainer(ctx, e2eNet,
+					"upstreams:",
+					"  groups:",
+					"    default:",
+					"      - moka1",
+					"customDNS:",
+					"  customTTL: 1h",
+					"  clientGroups:",
+					"    default:",
+					"      mapping:",
+					"        default.lan: 192.168.1.1",
+					"    192.168.1.0/24:",
+					"      mapping:",
+					"        internal.lan: 10.0.0.1",
+					"        specific.lan: 192.168.1.99",
+				)
+				Expect(err).Should(Succeed())
+			})
+
+			It("Should resolve PTR records based on client group", func(ctx context.Context) {
+				By("Resolving PTR record for CIDR group mapping", func() {
+					// Create a PTR query for 192.168.1.99 from a client in the same CIDR
+					ptrName, err := dns.ReverseAddr("192.168.1.99")
+					Expect(err).Should(Succeed())
+
+					msg := util.NewMsgWithQuestion(ptrName, PTR)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{192, 168, 1, 50}, // Matches CIDR group
+					})
+
+					Expect(doDNSRequest(ctx, blocky, msg)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord(ptrName, PTR, "specific.lan."),
+								HaveTTL(BeNumerically("==", 3600)),
+							))
+				})
+
+				By("Not resolving PTR record for different client group", func() {
+					// Same PTR query but from a client not in the CIDR group
+					ptrName, err := dns.ReverseAddr("192.168.1.99")
+					Expect(err).Should(Succeed())
+
+					msg := util.NewMsgWithQuestion(ptrName, PTR)
+					msg.SetEdns0(4096, false)
+					msg.IsEdns0().Option = append(msg.IsEdns0().Option, &dns.EDNS0_SUBNET{
+						Code:          dns.EDNS0SUBNET,
+						Family:        1, // IPv4
+						SourceNetmask: 32,
+						SourceScope:   0,
+						Address:       []byte{10, 0, 0, 50}, // Doesn't match CIDR -> default group
+					})
+
+					// Should not resolve since default group doesn't have this IP mapping
+					resp, err := doDNSRequest(ctx, blocky, msg)
+					Expect(err).Should(Succeed())
+					Expect(resp.Answer).Should(BeEmpty())
+				})
+			})
+		})
+	})
 })

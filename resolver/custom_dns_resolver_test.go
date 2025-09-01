@@ -490,4 +490,309 @@ var _ = Describe("CustomDNSResolver", func() {
 			})
 		})
 	})
+
+	Describe("Client Groups", func() {
+		var cfgWithGroups config.CustomDNS
+
+		BeforeEach(func() {
+			cfgWithGroups = config.CustomDNS{
+				ClientGroups: map[string]config.CustomDNSGroup{
+					"default": {
+						Mapping: config.CustomDNSMapping{
+							"default.domain": {&dns.A{A: net.ParseIP("192.168.1.1")}},
+						},
+					},
+					"laptop*": {
+						Mapping: config.CustomDNSMapping{
+							"laptop.domain": {&dns.A{A: net.ParseIP("192.168.1.100")}},
+						},
+						RewriterConfig: config.RewriterConfig{
+							Rewrite: map[string]string{
+								"^laptop-(.*)$": "device-$1.internal",
+							},
+						},
+					},
+					"192.168.1.0/24": {
+						Mapping: config.CustomDNSMapping{
+							"internal.domain": {&dns.A{A: net.ParseIP("10.0.0.1")}},
+						},
+					},
+					"192.168.1.10": {
+						Mapping: config.CustomDNSMapping{
+							"specific.domain": {&dns.A{A: net.ParseIP("192.168.1.99")}},
+						},
+					},
+				},
+				CustomTTL:           config.Duration(time.Duration(TTL) * time.Second),
+				FilterUnmappedTypes: true,
+			}
+		})
+
+		JustBeforeEach(func() {
+			sut = NewCustomDNSResolver(cfgWithGroups)
+			m = &mockResolver{}
+			m.On("Resolve", mock.Anything).Return(&Response{Res: new(dns.Msg)}, nil)
+			sut.Next(m)
+		})
+
+		Describe("resolveClientGroup", func() {
+			It("should match exact IP address first", func() {
+				request := newRequestWithClientID("test.domain.", A, "192.168.1.10", "laptop-01")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("192.168.1.10"))
+			})
+
+			It("should match wildcard client name second", func() {
+				request := newRequestWithClientID("test.domain.", A, "192.168.1.50", "laptop-01")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("laptop*"))
+			})
+
+			It("should match CIDR subnet third", func() {
+				request := newRequestWithClientID("test.domain.", A, "192.168.1.50", "desktop-01")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("192.168.1.0/24"))
+			})
+
+			It("should fallback to default group", func() {
+				request := newRequestWithClientID("test.domain.", A, "10.0.0.50", "server-01")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("default"))
+			})
+
+			It("should handle multiple wildcard patterns", func() {
+				cfgWithGroups.ClientGroups["desktop*"] = config.CustomDNSGroup{
+					Mapping: config.CustomDNSMapping{
+						"desktop.domain": {&dns.A{A: net.ParseIP("192.168.1.200")}},
+					},
+				}
+				sut = NewCustomDNSResolver(cfgWithGroups)
+
+				request := newRequestWithClientID("test.domain.", A, "10.0.0.50", "desktop-02")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("desktop*"))
+			})
+
+			It("should handle multiple CIDR patterns", func() {
+				cfgWithGroups.ClientGroups["10.0.0.0/16"] = config.CustomDNSGroup{
+					Mapping: config.CustomDNSMapping{
+						"corporate.domain": {&dns.A{A: net.ParseIP("10.0.0.100")}},
+					},
+				}
+				sut = NewCustomDNSResolver(cfgWithGroups)
+
+				request := newRequestWithClientID("test.domain.", A, "10.0.5.50", "unknown")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("10.0.0.0/16"))
+			})
+
+			It("should prefer more specific CIDR over less specific", func() {
+				cfgWithGroups.ClientGroups["192.168.0.0/16"] = config.CustomDNSGroup{
+					Mapping: config.CustomDNSMapping{
+						"wide.domain": {&dns.A{A: net.ParseIP("192.168.0.100")}},
+					},
+				}
+				sut = NewCustomDNSResolver(cfgWithGroups)
+
+				request := newRequestWithClientID("test.domain.", A, "192.168.1.50", "unknown")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("192.168.1.0/24")) // More specific /24 wins over /16
+			})
+
+			It("should handle missing client IP", func() {
+				request := newRequestWithClientID("test.domain.", A, "", "laptop-01")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("laptop*")) // Should still match by name
+			})
+
+			It("should handle missing client name", func() {
+				request := newRequestWithClientID("test.domain.", A, "192.168.1.50", "")
+				group := sut.resolveClientGroup(request)
+				Expect(group).Should(Equal("192.168.1.0/24")) // Should still match by CIDR
+			})
+		})
+
+		Describe("DNS resolution per client group", func() {
+			Context("when client matches exact IP", func() {
+				It("should resolve using specific IP group mapping", func() {
+					request := newRequestWithClientID("specific.domain.", A, "192.168.1.10", "laptop-01")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("specific.domain.", A, "192.168.1.99"),
+								HaveTTL(BeNumerically("==", TTL)),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReason("CUSTOM DNS"),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					m.AssertNotCalled(GinkgoT(), "Resolve", mock.Anything)
+				})
+			})
+
+			Context("when client matches wildcard name", func() {
+				It("should resolve using wildcard group mapping", func() {
+					request := newRequestWithClientID("laptop.domain.", A, "10.0.0.50", "laptop-01")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("laptop.domain.", A, "192.168.1.100"),
+								HaveTTL(BeNumerically("==", TTL)),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReason("CUSTOM DNS"),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					m.AssertNotCalled(GinkgoT(), "Resolve", mock.Anything)
+				})
+
+				It("should apply group-specific rewrite rules", func() {
+					request := newRequestWithClientID("laptop-dev.", A, "10.0.0.50", "laptop-01")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								HaveNoAnswer(),
+								HaveResponseType(ResponseTypeRESOLVED),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					// Should have been rewritten to device-dev.internal and delegated
+					m.AssertCalled(GinkgoT(), "Resolve", mock.MatchedBy(func(req *Request) bool {
+						return req.Req.Question[0].Name == "device-dev.internal."
+					}))
+				})
+			})
+
+			Context("when client matches CIDR subnet", func() {
+				It("should resolve using CIDR group mapping", func() {
+					request := newRequestWithClientID("internal.domain.", A, "192.168.1.50", "desktop-01")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("internal.domain.", A, "10.0.0.1"),
+								HaveTTL(BeNumerically("==", TTL)),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReason("CUSTOM DNS"),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					m.AssertNotCalled(GinkgoT(), "Resolve", mock.Anything)
+				})
+			})
+
+			Context("when client falls back to default group", func() {
+				It("should resolve using default group mapping", func() {
+					request := newRequestWithClientID("default.domain.", A, "10.0.0.50", "server-01")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("default.domain.", A, "192.168.1.1"),
+								HaveTTL(BeNumerically("==", TTL)),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReason("CUSTOM DNS"),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					m.AssertNotCalled(GinkgoT(), "Resolve", mock.Anything)
+				})
+			})
+
+			Context("when domain not found in client group", func() {
+				It("should delegate to next resolver", func() {
+					request := newRequestWithClientID("unknown.domain.", A, "192.168.1.10", "laptop-01")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								HaveResponseType(ResponseTypeRESOLVED),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					m.AssertExpectations(GinkgoT())
+				})
+			})
+
+			Context("when client group has zone file records", func() {
+				BeforeEach(func() {
+					zoneHdr := dns.RR_Header{Ttl: zoneTTL}
+					laptopGroup := cfgWithGroups.ClientGroups["laptop*"]
+					laptopGroup.Zone = config.ZoneFileDNS{
+						RRs: config.CustomDNSMapping{
+							"zone.laptop.": {&dns.A{A: net.ParseIP("192.168.1.101"), Hdr: zoneHdr}},
+						},
+					}
+					cfgWithGroups.ClientGroups["laptop*"] = laptopGroup
+				})
+
+				It("should resolve using zone file TTL", func() {
+					request := newRequestWithClientID("zone.laptop.", A, "10.0.0.50", "laptop-01")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("zone.laptop.", A, "192.168.1.101"),
+								HaveTTL(BeNumerically("==", zoneTTL)),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReason("CUSTOM DNS"),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					m.AssertNotCalled(GinkgoT(), "Resolve", mock.Anything)
+				})
+			})
+
+			Context("when using reverse DNS with client groups", func() {
+				It("should resolve using client-specific reverse mappings", func() {
+					request := newRequestWithClientID("99.1.168.192.in-addr.arpa.", PTR, "192.168.1.10", "specific-client")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								WithTransform(ToAnswer, SatisfyAll(
+									HaveLen(1),
+									ContainElements(
+										BeDNSRecord("99.1.168.192.in-addr.arpa.", PTR, "specific.domain.")),
+								)),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReason("CUSTOM DNS"),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					m.AssertNotCalled(GinkgoT(), "Resolve", mock.Anything)
+				})
+			})
+		})
+
+		Describe("backward compatibility", func() {
+			Context("when legacy mapping exists alongside client groups", func() {
+				BeforeEach(func() {
+					cfgWithGroups.Mapping = config.CustomDNSMapping{
+						"legacy.domain": {&dns.A{A: net.ParseIP("1.2.3.4")}},
+					}
+				})
+
+				It("should migrate legacy config to default group automatically", func() {
+					sut = NewCustomDNSResolver(cfgWithGroups)
+					request := newRequestWithClientID("legacy.domain.", A, "10.0.0.50", "any-client")
+
+					Expect(sut.Resolve(ctx, request)).
+						Should(
+							SatisfyAll(
+								BeDNSRecord("legacy.domain.", A, "1.2.3.4"),
+								HaveTTL(BeNumerically("==", TTL)),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReason("CUSTOM DNS"),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+
+					m.AssertNotCalled(GinkgoT(), "Resolve", mock.Anything)
+				})
+			})
+		})
+	})
 })

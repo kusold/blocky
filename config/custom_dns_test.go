@@ -232,4 +232,143 @@ www A 1.2.3.4
 			Expect(err).Should(MatchError("Failed to unmarshal"))
 		})
 	})
+
+	Describe("ClientGroups", func() {
+		var cfgWithGroups CustomDNS
+
+		BeforeEach(func() {
+			cfgWithGroups = CustomDNS{
+				ClientGroups: map[string]CustomDNSGroup{
+					"default": {
+						Mapping: CustomDNSMapping{
+							"default.domain": {&dns.A{A: net.ParseIP("192.168.1.1")}},
+						},
+					},
+					"laptop*": {
+						Mapping: CustomDNSMapping{
+							"laptop.domain": {&dns.A{A: net.ParseIP("192.168.1.100")}},
+						},
+						RewriterConfig: RewriterConfig{
+							Rewrite: map[string]string{
+								"^laptop-(.*)$": "device-$1.internal",
+							},
+						},
+					},
+					"192.168.1.0/24": {
+						Mapping: CustomDNSMapping{
+							"internal.domain": {&dns.A{A: net.ParseIP("10.0.0.1")}},
+						},
+					},
+					"192.168.1.10": {
+						Mapping: CustomDNSMapping{
+							"specific.domain": {&dns.A{A: net.ParseIP("192.168.1.99")}},
+						},
+					},
+				},
+			}
+		})
+
+		Describe("IsEnabled", func() {
+			It("should be true when client groups are configured", func() {
+				Expect(cfgWithGroups.IsEnabled()).Should(BeTrue())
+			})
+
+			It("should be false when no client groups are configured", func() {
+				cfg := CustomDNS{ClientGroups: map[string]CustomDNSGroup{}}
+				Expect(cfg.IsEnabled()).Should(BeFalse())
+			})
+		})
+
+		Describe("migrate", func() {
+			It("should migrate legacy config to default group", func() {
+				legacyCfg := CustomDNS{
+					Mapping: CustomDNSMapping{
+						"legacy.domain": {&dns.A{A: net.ParseIP("1.2.3.4")}},
+					},
+					RewriterConfig: RewriterConfig{
+						Rewrite: map[string]string{
+							"^old-(.*)$": "new-$1.com",
+						},
+					},
+				}
+
+				migrated := legacyCfg.migrate(logger)
+
+				Expect(migrated).Should(BeTrue())
+				Expect(legacyCfg.ClientGroups).Should(HaveKey("default"))
+				Expect(legacyCfg.ClientGroups["default"].Mapping).Should(HaveKey("legacy.domain"))
+				Expect(legacyCfg.ClientGroups["default"].RewriterConfig.Rewrite).Should(HaveLen(1))
+				Expect(legacyCfg.Mapping).Should(BeEmpty())
+				Expect(legacyCfg.RewriterConfig.Rewrite).Should(BeEmpty())
+			})
+
+			It("should not migrate when client groups already exist", func() {
+				originalMapping := cfgWithGroups.ClientGroups["default"].Mapping
+				migrated := cfgWithGroups.migrate(logger)
+
+				Expect(migrated).Should(BeFalse())
+				Expect(cfgWithGroups.ClientGroups["default"].Mapping).Should(Equal(originalMapping))
+			})
+		})
+
+		Describe("validateClientGroups", func() {
+			It("should pass validation for valid client groups", func() {
+				err := cfgWithGroups.validateClientGroups()
+				Expect(err).Should(Succeed())
+			})
+
+			It("should fail for invalid CIDR", func() {
+				cfgWithGroups.ClientGroups["192.168.1.0/33"] = CustomDNSGroup{
+					Mapping: CustomDNSMapping{"test": {&dns.A{A: net.ParseIP("1.2.3.4")}}},
+				}
+
+				err := cfgWithGroups.validateClientGroups()
+				Expect(err).Should(HaveOccurred())
+				Expect(err.Error()).Should(ContainSubstring("invalid client group name"))
+			})
+
+			It("should fail for invalid wildcard pattern", func() {
+				cfgWithGroups.ClientGroups["client[invalid"] = CustomDNSGroup{
+					Mapping: CustomDNSMapping{"test": {&dns.A{A: net.ParseIP("1.2.3.4")}}},
+				}
+
+				err := cfgWithGroups.validateClientGroups()
+				Expect(err).Should(HaveOccurred())
+				Expect(err.Error()).Should(ContainSubstring("invalid wildcard pattern"))
+			})
+
+			It("should accept wildcard patterns", func() {
+				cfgWithGroups.ClientGroups["client*"] = CustomDNSGroup{
+					Mapping: CustomDNSMapping{"test": {&dns.A{A: net.ParseIP("1.2.3.4")}}},
+				}
+
+				err := cfgWithGroups.validateClientGroups()
+				Expect(err).Should(Succeed())
+			})
+
+			It("should accept arbitrary names for client groups", func() {
+				cfgWithGroups.ClientGroups["mydevices"] = CustomDNSGroup{
+					Mapping: CustomDNSMapping{"test": {&dns.A{A: net.ParseIP("1.2.3.4")}}},
+				}
+
+				err := cfgWithGroups.validateClientGroups()
+				Expect(err).Should(Succeed())
+			})
+		})
+
+		Describe("LogConfig", func() {
+			It("should log client groups configuration", func() {
+				cfgWithGroups.LogConfig(logger)
+
+				Expect(hook.Calls).ShouldNot(BeEmpty())
+				Expect(hook.Messages).Should(ContainElements(
+					ContainSubstring("client groups configured"),
+					ContainSubstring("default"),
+					ContainSubstring("laptop*"),
+					ContainSubstring("192.168.1.0/24"),
+					ContainSubstring("192.168.1.10"),
+				))
+			})
+		})
+	})
 })

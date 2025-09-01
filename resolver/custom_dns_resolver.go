@@ -24,61 +24,161 @@ type CustomDNSResolver struct {
 	typed
 
 	createAnswerFromQuestion createAnswerFunc
-	mapping                  config.CustomDNSMapping
-	reverseAddresses         map[string][]string
+
+	// Client group support
+	clientGroups map[string]config.CustomDNSGroup
+
+	// Backward compatibility (for single mapping)
+	mapping          config.CustomDNSMapping
+	reverseAddresses map[string][]string
 }
 
 // NewCustomDNSResolver creates new resolver instance
 func NewCustomDNSResolver(cfg config.CustomDNS) *CustomDNSResolver {
-	dnsRecords := make(config.CustomDNSMapping, len(cfg.Mapping)+len(cfg.Zone.RRs))
+	r := &CustomDNSResolver{
+		configurable:             withConfig(&cfg),
+		typed:                    withType("custom_dns"),
+		createAnswerFromQuestion: util.CreateAnswerFromQuestion,
+	}
 
-	for url, entries := range cfg.Mapping {
-		url = util.ExtractDomainOnly(url)
-		dnsRecords[url] = entries
+	// Handle client groups
+	if len(cfg.ClientGroups) > 0 {
+		r.clientGroups = make(map[string]config.CustomDNSGroup, len(cfg.ClientGroups))
 
-		for _, entry := range entries {
-			entry.Header().Ttl = cfg.CustomTTL.SecondsU32()
+		// Copy client groups and process TTL for mapping entries
+		for groupName, group := range cfg.ClientGroups {
+			// Process TTL for mapping entries
+			for _, entries := range group.Mapping {
+				for _, entry := range entries {
+					entry.Header().Ttl = cfg.CustomTTL.SecondsU32()
+				}
+			}
+			r.clientGroups[groupName] = group
+		}
+	} else {
+		// Backward compatibility: create single mapping from old format
+		r.mapping = make(config.CustomDNSMapping, len(cfg.Mapping)+len(cfg.Zone.RRs))
+
+		// Process old-style mapping
+		for url, entries := range cfg.Mapping {
+			url = util.ExtractDomainOnly(url)
+			r.mapping[url] = entries
+
+			for _, entry := range entries {
+				entry.Header().Ttl = cfg.CustomTTL.SecondsU32()
+			}
+		}
+
+		// Process old-style zone
+		for url, entries := range cfg.Zone.RRs {
+			url = util.ExtractDomainOnly(url)
+			r.mapping[url] = entries
 		}
 	}
 
-	for url, entries := range cfg.Zone.RRs {
-		url = util.ExtractDomainOnly(url)
-		dnsRecords[url] = entries
+	// Build reverse address mapping
+	r.reverseAddresses = r.buildReverseAddressMappings()
+
+	return r
+}
+
+// buildReverseAddressMappings creates reverse DNS mappings for all groups
+func (r *CustomDNSResolver) buildReverseAddressMappings() map[string][]string {
+	reverse := make(map[string][]string)
+
+	// Handle client groups
+	for _, group := range r.clientGroups {
+		r.addReverseMapping(reverse, group.Mapping)
+		r.addReverseMapping(reverse, group.Zone.RRs)
 	}
 
-	reverse := make(map[string][]string, len(dnsRecords))
+	// Handle legacy mapping
+	if r.mapping != nil {
+		r.addReverseMapping(reverse, r.mapping)
+	}
 
-	for url, entries := range dnsRecords {
+	return reverse
+}
+
+// addReverseMapping adds reverse DNS mappings for a DNS mapping
+func (r *CustomDNSResolver) addReverseMapping(reverse map[string][]string, mapping config.CustomDNSMapping) {
+	for url, entries := range mapping {
 		for _, entry := range entries {
 			a, isA := entry.(*dns.A)
-
 			if isA {
-				r, _ := dns.ReverseAddr(a.A.String())
-				reverse[r] = append(reverse[r], url)
+				reverseAddr, _ := dns.ReverseAddr(a.A.String())
+				reverse[reverseAddr] = append(reverse[reverseAddr], url)
 			}
 
 			aaaa, isAAAA := entry.(*dns.AAAA)
-
 			if isAAAA {
-				r, _ := dns.ReverseAddr(aaaa.AAAA.String())
-				reverse[r] = append(reverse[r], url)
+				reverseAddr, _ := dns.ReverseAddr(aaaa.AAAA.String())
+				reverse[reverseAddr] = append(reverse[reverseAddr], url)
 			}
 		}
-	}
-
-	return &CustomDNSResolver{
-		configurable: withConfig(&cfg),
-		typed:        withType("custom_dns"),
-
-		createAnswerFromQuestion: util.CreateAnswerFromQuestion,
-		mapping:                  dnsRecords,
-		reverseAddresses:         reverse,
 	}
 }
 
 func isSupportedType(ip net.IP, question dns.Question) bool {
 	return (ip.To4() != nil && question.Qtype == dns.TypeA) ||
 		(strings.Contains(ip.String(), ":") && question.Qtype == dns.TypeAAAA)
+}
+
+// resolveClientGroup determines which client group to use for a request
+func (r *CustomDNSResolver) resolveClientGroup(request *model.Request) string {
+	// If no client groups configured, use legacy mode
+	if len(r.clientGroups) == 0 {
+		return ""
+	}
+
+	clientIP := request.ClientIP.String()
+	clientName := request.RequestClientID
+
+	// 1. Check exact IP match
+	if _, exists := r.clientGroups[clientIP]; exists {
+		return clientIP
+	}
+
+	// 2. Check client name patterns (with wildcards)
+	for groupName := range r.clientGroups {
+		if util.ClientNameMatchesGroupName(groupName, clientName) {
+			return groupName
+		}
+	}
+
+	// 3. Check CIDR subnet matches
+	for groupName := range r.clientGroups {
+		if util.CidrContainsIP(groupName, request.ClientIP) {
+			return groupName
+		}
+	}
+
+	// 4. Fall back to default group
+	return "default"
+}
+
+// getClientGroupConfig returns the appropriate DNS mapping and rewrite config for a client group
+func (r *CustomDNSResolver) getClientGroupConfig(groupName string) (config.CustomDNSMapping, config.RewriterConfig) {
+	// Legacy mode: use the single mapping
+	if groupName == "" {
+		return r.mapping, r.cfg.RewriterConfig
+	}
+
+	// Client group mode: get group-specific config
+	if group, exists := r.clientGroups[groupName]; exists {
+		// Combine group mapping with zone mapping
+		combined := make(config.CustomDNSMapping)
+		for domain, entries := range group.Mapping {
+			combined[domain] = entries
+		}
+		for domain, entries := range group.Zone.RRs {
+			combined[domain] = entries
+		}
+		return combined, group.RewriterConfig
+	}
+
+	// Fallback to empty config
+	return make(config.CustomDNSMapping), config.RewriterConfig{}
 }
 
 func (r *CustomDNSResolver) handleReverseDNS(request *model.Request) *model.Response {
@@ -116,12 +216,30 @@ func (r *CustomDNSResolver) processRequest(
 	question := request.Req.Question[0]
 	domain := util.ExtractDomain(question)
 
+	// Resolve client group and get appropriate mapping
+	clientGroup := r.resolveClientGroup(request)
+	mapping, rewriterConfig := r.getClientGroupConfig(clientGroup)
+
+	// Apply domain rewriting if configured
+	originalDomain := domain
+	for rewriteFrom, rewriteTo := range rewriterConfig.Rewrite {
+		if strings.Contains(domain, rewriteFrom) {
+			domain = strings.ReplaceAll(domain, rewriteFrom, rewriteTo)
+			logger.WithFields(logrus.Fields{
+				"originalDomain":  originalDomain,
+				"rewrittenDomain": domain,
+				"clientGroup":     clientGroup,
+			}).Debugf("domain rewritten")
+			break
+		}
+	}
+
 	for len(domain) > 0 {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		entries, found := r.mapping[domain]
+		entries, found := mapping[domain]
 
 		if found {
 			for _, entry := range entries {
@@ -135,8 +253,9 @@ func (r *CustomDNSResolver) processRequest(
 
 			if len(response.Answer) > 0 {
 				logger.WithFields(logrus.Fields{
-					"answer": util.AnswerToString(response.Answer),
-					"domain": domain,
+					"answer":      util.AnswerToString(response.Answer),
+					"domain":      domain,
+					"clientGroup": clientGroup,
 				}).Debugf("returning custom dns entry")
 
 				return &model.Response{Res: response, RType: model.ResponseTypeCUSTOMDNS, Reason: "CUSTOM DNS"}, nil

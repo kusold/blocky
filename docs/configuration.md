@@ -29,13 +29,13 @@ configuration properties as [JSON](config.yml).
 
 All values in this section are optional.
 
-| Parameter   | Type                  | Default value | Description                                                                                                                                       |
-| ----------- | --------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ports.dns   | One or more [IP]:Port | 53            | Listen address for DNS (TCP and UDP). Example: `53`, `:53`, `192.168.0.1:53`, `[53, "[::1]:53"]`                                                  |
-| ports.tls   | One or more [IP]:Port |               | Listen address for DoT (DNS-over-TLS). Example: `83`, `:853`, `192.168.0.1:853`, `[853, "[::1]:853"]`                                             |
-| ports.http  | One or more [IP]:Port |               | Listen address for HTTP used for prometheus metrics, pprof, REST API, DoH... Example: `4000`, `:4000`, `192.168.0.1:4000`, `[4000, "[::1]:4000"]` |
-| ports.https | One or more [IP]:Port |               | Listen address for HTTPS used for prometheus metrics, pprof, REST API, DoH... Example: `443`, `:443`, `192.168.0.1:443`, `[443, "[::1]:443"]`     |
-| ports.dohPath | string | /dns-query | URL path for DoH queries.
+| Parameter     | Type                  | Default value | Description                                                                                                                                       |
+|---------------|-----------------------|---------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+| ports.dns     | One or more [IP]:Port | 53            | Listen address for DNS (TCP and UDP). Example: `53`, `:53`, `192.168.0.1:53`, `[53, "[::1]:53"]`                                                  |
+| ports.tls     | One or more [IP]:Port |               | Listen address for DoT (DNS-over-TLS). Example: `83`, `:853`, `192.168.0.1:853`, `[853, "[::1]:853"]`                                             |
+| ports.http    | One or more [IP]:Port |               | Listen address for HTTP used for prometheus metrics, pprof, REST API, DoH... Example: `4000`, `:4000`, `192.168.0.1:4000`, `[4000, "[::1]:4000"]` |
+| ports.https   | One or more [IP]:Port |               | Listen address for HTTPS used for prometheus metrics, pprof, REST API, DoH... Example: `443`, `:443`, `192.168.0.1:443`, `[443, "[::1]:443"]`     |
+| ports.dohPath | string                | /dns-query    | URL path for DoH queries.                                                                                                                         |
 
 !!! example
 
@@ -267,6 +267,7 @@ Custom DNS supports multiple record types (A, AAAA, CNAME, TXT, SRV) and provide
 | rewrite             | string: string (domain: domain)                        | no        |               | Domain rewriting rules applied before DNS resolution                                       |
 | mapping             | string: string (hostname: address or CNAME)            | no        |               | Simple domain to IP/CNAME mappings                                                         |
 | zone                | string containing a DNS Zone                           | no        |               | DNS zone file content for more complex configurations                                      |
+| clientGroups        | map of group name to client group config               | no        |               | Client-specific DNS configurations (see Client Groups section)                             |
 | filterUnmappedTypes | boolean                                                | no        | true          | Whether to filter query types that aren't defined for a domain or forward them to upstream |
 
 ### Simple Mapping
@@ -350,6 +351,179 @@ Blocky automatically creates reverse DNS (PTR) records for all defined A and AAA
 With `filterUnmappedTypes = true` (default), blocky will filter all queries with unmapped types. For example, if you only define an A record for `printer.lan`, an AAAA query for the same domain will return an empty result.
 
 With `filterUnmappedTypes = false`, unmapped type queries will be forwarded to the upstream DNS server. For example, an AAAA query for `printer.lan` (when only an A record is defined) will be sent to the upstream resolver.
+
+### Client Groups
+
+You can define different DNS mappings and configurations for different clients based on their IP address, client name, or subnet (CIDR). This allows you to provide customized DNS resolution for different devices, networks, or users.
+
+Client group resolution follows a priority order:
+1. **Exact IP address match** - Highest priority  
+2. **Client name wildcard pattern match** - Second priority
+3. **CIDR subnet match** - Third priority (most specific subnet wins)
+4. **Default group fallback** - Lowest priority
+
+| Parameter     | Type                         | Mandatory | Default value | Description                                                          |
+| ------------- | ---------------------------- | --------- | ------------- | -------------------------------------------------------------------- |
+| clientGroups  | map of group name to config  | no        |               | Client-specific DNS configurations mapped by client identifier      |
+
+Each client group supports all the same parameters as the global customDNS configuration:
+- `mapping` - Domain to IP mappings specific to this client group
+- `rewrite` - Domain rewriting rules specific to this client group  
+- `zone` - DNS zone file content specific to this client group
+
+#### Client Group Examples
+
+**Basic Client Groups:**
+
+!!! example
+
+    ```yaml
+    customDNS:
+      # Global settings inherited by all groups
+      customTTL: 30m
+      filterUnmappedTypes: true
+      
+      clientGroups:
+        # Default group for unmatched clients
+        default:
+          mapping:
+            router.lan: 192.168.1.1
+            printer.lan: 192.168.1.100
+        
+        # Exact IP address match
+        192.168.1.10:
+          mapping:
+            server.local: 192.168.1.10
+            api.local: 192.168.1.11
+        
+        # CIDR subnet match
+        192.168.1.0/24:
+          mapping:
+            internal.local: 10.0.0.1
+            database.local: 10.0.0.2
+        
+        # Wildcard client name match  
+        laptop*:
+          mapping:
+            dev.local: 192.168.1.50
+            staging.local: 192.168.1.51
+          rewrite:
+            dev: local
+    ```
+
+**Advanced Client Groups with Zone Files:**
+
+!!! example
+
+    ```yaml
+    customDNS:
+      customTTL: 1h
+      
+      clientGroups:
+        default:
+          mapping:
+            router.lan: 192.168.1.1
+            
+        # Development team subnet
+        10.0.1.0/24:
+          zone: |
+            $ORIGIN dev.local.
+            api 3600 A 10.0.1.100
+            db 3600 A 10.0.1.101
+            cache 3600 CNAME api
+          rewrite:
+            internal: dev.local
+            
+        # Management devices
+        management*:
+          mapping:
+            switch.mgmt: 192.168.100.10
+            firewall.mgmt: 192.168.100.1
+          zone: |
+            $ORIGIN mgmt.local.
+            monitoring 3600 A 192.168.100.20
+            backup 3600 A 192.168.100.21
+    ```
+
+#### Client Identification
+
+Clients are identified through the following methods:
+
+1. **IP Address**: From the client's source IP address in the DNS request
+2. **Client Name**: From client name resolution (reverse DNS, DHCP, or external sources)
+3. **EDNS0 Client Subnet**: From EDNS0 client subnet extension if present
+
+#### Client Group Name Patterns
+
+- **Exact IP**: `192.168.1.10` - Matches only that specific IP address
+- **CIDR Subnet**: `192.168.1.0/24` - Matches any IP in that subnet range
+- **Wildcard Names**: `laptop*` - Matches client names starting with "laptop"
+- **Arbitrary Names**: `mydevices` - Used for custom grouping logic
+
+#### Priority Resolution Example
+
+Given this configuration:
+
+!!! example
+
+    ```yaml
+    customDNS:
+      clientGroups:
+        default:
+          mapping:
+            test.lan: 192.168.1.1
+        laptop*:
+          mapping:
+            test.lan: 192.168.1.100
+        192.168.1.0/24:
+          mapping:
+            test.lan: 10.0.0.1
+        192.168.1.10:
+          mapping:
+            test.lan: 192.168.1.99
+    ```
+
+A DNS query for `test.lan` from IP `192.168.1.10` with client name `laptop-01` will resolve to `192.168.1.99` because the exact IP match (`192.168.1.10`) has the highest priority, even though the client name would also match `laptop*` and the IP would match the CIDR `192.168.1.0/24`.
+
+#### Backward Compatibility
+
+Existing configurations using the legacy format will automatically migrate to the `default` client group:
+
+!!! example
+
+    ```yaml
+    customDNS:
+      # Legacy format (automatically migrated)
+      mapping:
+        printer.lan: 192.168.178.3
+      rewrite:
+        home: lan
+        
+      # New client groups format
+      clientGroups:
+        laptop*:
+          mapping:
+            dev.local: 192.168.1.50
+    ```
+
+The legacy `mapping` and `rewrite` sections will be moved to a `default` client group, ensuring all existing configurations continue to work unchanged.
+
+#### Troubleshooting Client Groups
+
+**Check client group resolution:**
+- Enable debug logging to see which client group is selected for each request
+- Verify client IP addresses and names are being identified correctly
+- Ensure CIDR notation is valid (e.g., `192.168.1.0/24` not `192.168.1.0\24`)
+
+**Common issues:**
+- **Wildcard patterns**: Use `*` for wildcard matching (e.g., `laptop*`), not regex
+- **CIDR specificity**: More specific subnets take priority (e.g., `/24` over `/16`)
+- **Client identification**: Ensure client names are being resolved if using name-based groups
+
+**Performance considerations:**
+- Large numbers of client groups (>100) may impact performance
+- Use CIDR ranges instead of many individual IP addresses when possible
+- Consider using the default group for common mappings shared across clients
 
 ## Conditional DNS resolution
 

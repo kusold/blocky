@@ -619,6 +619,7 @@ func (cfg *Config) migrate(logger *logrus.Entry) bool {
 
 	usesDepredOpts = cfg.Blocking.migrate(logger) || usesDepredOpts
 	usesDepredOpts = cfg.HostsFile.migrate(logger) || usesDepredOpts
+	usesDepredOpts = cfg.CustomDNS.migrate(logger) || usesDepredOpts
 
 	return usesDepredOpts
 }
@@ -626,6 +627,10 @@ func (cfg *Config) migrate(logger *logrus.Entry) bool {
 func (cfg *Config) validate(logger *logrus.Entry) {
 	cfg.MinTLSServeVer.validate(logger)
 	cfg.Upstreams.validate(logger)
+
+	if err := cfg.CustomDNS.validateClientGroups(); err != nil {
+		logger.Fatalf("CustomDNS validation failed: %v", err)
+	}
 }
 
 // ConvertPort converts string representation into a valid port (0 - 65535)
