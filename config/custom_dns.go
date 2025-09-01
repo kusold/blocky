@@ -37,23 +37,45 @@ type CustomDNSGroup struct {
 func (c *CustomDNS) migrate(logger *logrus.Entry) bool {
 	migrated := false
 
-	// If we have legacy fields, migrate them to the default group
-	if len(c.Mapping) > 0 || len(c.Rewrite) > 0 || len(c.Zone.RRs) > 0 {
+	// Conservative migration approach:
+	// Only migrate legacy fields if client groups are explicitly defined
+	// This preserves backward compatibility for pure legacy configurations
+
+	hasLegacyFields := len(c.Mapping) > 0 || len(c.Rewrite) > 0 || len(c.Zone.RRs) > 0
+	hasClientGroups := len(c.ClientGroups) > 0
+
+	if hasClientGroups && hasLegacyFields {
+		// User has adopted client groups but still has legacy fields - migrate them
 		logger.Warn("migrating CustomDNS configuration from old format to client groups format")
 		logger.Warn("consider updating your configuration to use 'clientGroups.default' instead of top-level 'mapping'")
 
-		if c.ClientGroups == nil {
-			c.ClientGroups = make(map[string]CustomDNSGroup)
+		// Create or update default group with existing configuration
+		if _, hasDefault := c.ClientGroups["default"]; !hasDefault {
+			// Create new default group
+			defaultGroup := CustomDNSGroup{
+				RewriterConfig: c.RewriterConfig,
+				Mapping:        c.Mapping,
+				Zone:           c.Zone,
+			}
+			c.ClientGroups["default"] = defaultGroup
+		} else {
+			// Merge with existing default group
+			defaultGroup := c.ClientGroups["default"]
+			if defaultGroup.Mapping == nil {
+				defaultGroup.Mapping = make(CustomDNSMapping)
+			}
+			for k, v := range c.Mapping {
+				defaultGroup.Mapping[k] = v
+			}
+			if defaultGroup.RewriterConfig.Rewrite == nil {
+				defaultGroup.RewriterConfig.Rewrite = make(map[string]string)
+			}
+			for k, v := range c.Rewrite {
+				defaultGroup.RewriterConfig.Rewrite[k] = v
+			}
+			c.ClientGroups["default"] = defaultGroup
 		}
 
-		// Create default group with existing configuration
-		defaultGroup := CustomDNSGroup{
-			RewriterConfig: c.RewriterConfig,
-			Mapping:        c.Mapping,
-			Zone:           c.Zone,
-		}
-
-		c.ClientGroups["default"] = defaultGroup
 		migrated = true
 
 		// Clear old fields after migration to avoid confusion

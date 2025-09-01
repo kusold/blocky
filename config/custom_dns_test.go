@@ -280,7 +280,7 @@ www A 1.2.3.4
 		})
 
 		Describe("migrate", func() {
-			It("should migrate legacy config to default group", func() {
+			It("should migrate legacy config to default group when client groups exist", func() {
 				legacyCfg := CustomDNS{
 					Mapping: CustomDNSMapping{
 						"legacy.domain": {&dns.A{A: net.ParseIP("1.2.3.4")}},
@@ -288,6 +288,14 @@ www A 1.2.3.4
 					RewriterConfig: RewriterConfig{
 						Rewrite: map[string]string{
 							"^old-(.*)$": "new-$1.com",
+						},
+					},
+					// Add client groups to trigger migration
+					ClientGroups: map[string]CustomDNSGroup{
+						"test": {
+							Mapping: CustomDNSMapping{
+								"test.domain": {&dns.A{A: net.ParseIP("5.6.7.8")}},
+							},
 						},
 					},
 				}
@@ -300,6 +308,27 @@ www A 1.2.3.4
 				Expect(legacyCfg.ClientGroups["default"].RewriterConfig.Rewrite).Should(HaveLen(1))
 				Expect(legacyCfg.Mapping).Should(BeEmpty())
 				Expect(legacyCfg.RewriterConfig.Rewrite).Should(BeEmpty())
+			})
+
+			It("should NOT migrate pure legacy config for backward compatibility", func() {
+				legacyCfg := CustomDNS{
+					Mapping: CustomDNSMapping{
+						"legacy.domain": {&dns.A{A: net.ParseIP("1.2.3.4")}},
+					},
+					RewriterConfig: RewriterConfig{
+						Rewrite: map[string]string{
+							"^old-(.*)$": "new-$1.com",
+						},
+					},
+					// No client groups - should preserve legacy format
+				}
+
+				migrated := legacyCfg.migrate(logger)
+
+				Expect(migrated).Should(BeFalse())
+				Expect(legacyCfg.ClientGroups).Should(BeEmpty())
+				Expect(legacyCfg.Mapping).Should(HaveKey("legacy.domain"))
+				Expect(legacyCfg.RewriterConfig.Rewrite).Should(HaveLen(1))
 			})
 
 			It("should not migrate when client groups already exist", func() {
