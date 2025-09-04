@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -53,7 +54,33 @@ func NewCustomDNSResolver(cfg config.CustomDNS) *CustomDNSResolver {
 					entry.Header().Ttl = cfg.CustomTTL.SecondsU32()
 				}
 			}
+
 			r.clientGroups[groupName] = group
+		}
+
+		// Backward compatibility: merge legacy mapping into default group if it exists
+		if len(cfg.Mapping) > 0 || len(cfg.Zone.RRs) > 0 {
+			defaultGroup := r.clientGroups["default"]
+			if defaultGroup.Mapping == nil {
+				defaultGroup.Mapping = make(config.CustomDNSMapping)
+			}
+
+			// Merge legacy mapping into default group
+			for url, entries := range cfg.Mapping {
+				url = util.ExtractDomainOnly(url)
+				defaultGroup.Mapping[url] = entries
+				for _, entry := range entries {
+					entry.Header().Ttl = cfg.CustomTTL.SecondsU32()
+				}
+			}
+
+			// Merge legacy zone into default group
+			for url, entries := range cfg.Zone.RRs {
+				url = util.ExtractDomainOnly(url)
+				defaultGroup.Mapping[url] = entries
+			}
+
+			r.clientGroups["default"] = defaultGroup
 		}
 	} else {
 		// Backward compatibility: create single mapping from old format
@@ -172,6 +199,7 @@ func (r *CustomDNSResolver) getClientGroupConfig(groupName string) (config.Custo
 			combined[domain] = entries
 		}
 		for domain, entries := range group.Zone.RRs {
+			domain = util.ExtractDomainOnly(domain)
 			combined[domain] = entries
 		}
 		return combined, group.RewriterConfig
@@ -222,16 +250,43 @@ func (r *CustomDNSResolver) processRequest(
 
 	// Apply domain rewriting if configured
 	originalDomain := domain
+	domainRewritten := false
 	for rewriteFrom, rewriteTo := range rewriterConfig.Rewrite {
-		if strings.Contains(domain, rewriteFrom) {
-			domain = strings.ReplaceAll(domain, rewriteFrom, rewriteTo)
-			logger.WithFields(logrus.Fields{
-				"originalDomain":  originalDomain,
-				"rewrittenDomain": domain,
-				"clientGroup":     clientGroup,
-			}).Debugf("domain rewritten")
-			break
+		if matched, err := regexp.MatchString(rewriteFrom, domain); err == nil && matched {
+			if re, err := regexp.Compile(rewriteFrom); err == nil {
+				domain = re.ReplaceAllString(domain, rewriteTo)
+				domainRewritten = true
+				logger.WithFields(logrus.Fields{
+					"originalDomain":  originalDomain,
+					"rewrittenDomain": domain,
+					"clientGroup":     clientGroup,
+				}).Debugf("domain rewritten")
+				break
+			}
 		}
+	}
+
+	// If domain was rewritten, create new request and delegate to next resolver
+	if domainRewritten {
+		if r.next != nil {
+			// Create new request with rewritten domain
+			newReq := request.Req.Copy()
+			newReq.Question[0].Name = dns.Fqdn(domain)
+			rewrittenRequest := &model.Request{
+				Req:             newReq,
+				ClientIP:        request.ClientIP,
+				RequestClientID: request.RequestClientID,
+				RequestTS:       request.RequestTS,
+				Protocol:        request.Protocol,
+				ClientNames:     request.ClientNames,
+			}
+			logger.WithField("next_resolver", Name(r.next)).Trace("delegating rewritten request to next resolver")
+			return r.next.Resolve(ctx, rewrittenRequest)
+		}
+
+		// No next resolver available for rewritten domain, return NXDOMAIN
+		response.SetRcode(request.Req, dns.RcodeNameError)
+		return &model.Response{Res: response, RType: model.ResponseTypeCUSTOMDNS, Reason: "CUSTOM DNS"}, nil
 	}
 
 	for len(domain) > 0 {
@@ -278,9 +333,14 @@ func (r *CustomDNSResolver) processRequest(
 		}
 	}
 
-	logger.WithField("next_resolver", Name(r.next)).Trace("go to next resolver")
+	if r.next != nil {
+		logger.WithField("next_resolver", Name(r.next)).Trace("go to next resolver")
+		return r.next.Resolve(ctx, request)
+	}
 
-	return r.next.Resolve(ctx, request)
+	// No next resolver available, return NXDOMAIN
+	response.SetRcode(request.Req, dns.RcodeNameError)
+	return &model.Response{Res: response, RType: model.ResponseTypeCUSTOMDNS, Reason: "CUSTOM DNS"}, nil
 }
 
 func (r *CustomDNSResolver) processDNSEntry(
